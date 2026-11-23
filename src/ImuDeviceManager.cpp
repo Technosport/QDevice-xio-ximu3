@@ -1,0 +1,298 @@
+#include "qdevice_ximu3/ImuDeviceManager.hpp"
+
+#include "Ximu3.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <functional>
+#include <thread>
+
+namespace qdevice_ximu3 {
+
+struct ImuDeviceManager::DeviceEntry {
+    ManagedImuConfig config;
+    std::unique_ptr<ImuSampleBuffer> buffer;
+    std::unique_ptr<ximu3::ConnectionConfig> conn_config;
+    std::unique_ptr<ximu3::Connection> connection;
+    bool connected = false;
+
+    // Callbacks must outlive the connection because ximu3::Connection stores &callback.
+    std::function<void(ximu3::XIMU3_QuaternionMessage)> cb_quat;
+    std::function<void(ximu3::XIMU3_EulerAnglesMessage)> cb_euler;
+    std::function<void(ximu3::XIMU3_InertialMessage)> cb_inertial;
+    std::function<void(ximu3::XIMU3_MagnetometerMessage)> cb_mag;
+    std::function<void(ximu3::XIMU3_LinearAccelerationMessage)> cb_lin_acc;
+    std::function<void(ximu3::XIMU3_SyncMessage)> cb_sync;
+    std::function<void(ximu3::XIMU3_BatteryMessage)> cb_battery;
+    std::function<void(ximu3::XIMU3_RssiMessage)> cb_rssi;
+};
+
+ImuDeviceManager::ImuDeviceManager() = default;
+
+ImuDeviceManager::~ImuDeviceManager() {
+    disconnectAll();
+}
+
+std::vector<DiscoveredImu> ImuDeviceManager::discoverDevices(uint32_t wait_ms) {
+    std::vector<DiscoveredImu> results;
+
+    // 1. Wi-Fi discovery via UDP NetworkAnnouncement
+    bool announcement_started = false;
+    {
+        ximu3::NetworkAnnouncement announcement;
+        if (announcement.getResult() == ximu3::XIMU3_ResultOk) {
+            announcement_started = true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
+            const auto messages = announcement.getMessages();
+            for (const auto& msg : messages) {
+                DiscoveredImu dev;
+                dev.device_name      = msg.device_name;
+                dev.serial_number    = msg.serial_number;
+                dev.ip_address       = msg.ip_address;
+                dev.tcp_port         = msg.tcp_port;
+                dev.udp_send_port    = msg.udp_send;
+                dev.udp_receive_port = msg.udp_receive;
+                dev.transport        = TransportType::Udp;
+                dev.rssi_pct         = msg.rssi;
+                dev.battery_pct      = msg.battery;
+                results.push_back(std::move(dev));
+            }
+        }
+    }
+    if (announcement_started) {
+        // NetworkAnnouncement::Drop sets *dropped = true without joining its 1 ms polling thread;
+        // wait briefly so the thread exits before the host can FreeLibrary() this DLL.
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+
+    // 2. Wired USB / Serial discovery via PortScanner
+    const auto usb_devices = ximu3::PortScanner::scanFilter(ximu3::XIMU3_PortTypeUsb);
+    for (const auto& d : usb_devices) {
+        DiscoveredImu dev;
+        dev.device_name   = d.device_name;
+        dev.serial_number = d.serial_number;
+        dev.port_name     = d.usb_connection_config.port_name;
+        dev.transport     = TransportType::Usb;
+        results.push_back(std::move(dev));
+    }
+
+    return results;
+}
+
+void ImuDeviceManager::addDevice(const ManagedImuConfig& config) {
+    auto entry = std::make_unique<DeviceEntry>();
+    entry->config = config;
+    entry->buffer = std::make_unique<ImuSampleBuffer>(config.channels);
+    devices_.push_back(std::move(entry));
+}
+
+void ImuDeviceManager::clearDevices() {
+    disconnectAll();
+    devices_.clear();
+}
+
+size_t ImuDeviceManager::connectAll() {
+    size_t ok_count = 0;
+
+    for (auto& entry : devices_) {
+        if (entry->connected) {
+            ++ok_count;
+            continue;
+        }
+
+        switch (entry->config.transport) {
+            case TransportType::Udp:
+                entry->conn_config = std::make_unique<ximu3::UdpConnectionConfig>(
+                    entry->config.address, entry->config.send_port, entry->config.receive_port);
+                break;
+            case TransportType::Tcp:
+                entry->conn_config = std::make_unique<ximu3::TcpConnectionConfig>(
+                    entry->config.address, entry->config.send_port);
+                break;
+            case TransportType::Usb:
+                entry->conn_config = std::make_unique<ximu3::UsbConnectionConfig>(
+                    entry->config.address);
+                break;
+            case TransportType::Serial:
+                entry->conn_config = std::make_unique<ximu3::SerialConnectionConfig>(
+                    entry->config.address, 115200, false);
+                break;
+        }
+
+        entry->connection = std::make_unique<ximu3::Connection>(*entry->conn_config);
+        ImuSampleBuffer* buf = entry->buffer.get();
+
+        entry->cb_quat = [buf](ximu3::XIMU3_QuaternionMessage m) {
+            buf->pushQuaternion(m.timestamp, m.w, m.x, m.y, m.z);
+        };
+        entry->cb_euler = [buf](ximu3::XIMU3_EulerAnglesMessage m) {
+            buf->pushEuler(m.timestamp, m.roll, m.pitch, m.yaw);
+        };
+        entry->cb_inertial = [buf](ximu3::XIMU3_InertialMessage m) {
+            buf->pushInertial(m.timestamp,
+                              m.gyroscope_x, m.gyroscope_y, m.gyroscope_z,
+                              m.accelerometer_x, m.accelerometer_y, m.accelerometer_z);
+        };
+        entry->cb_mag = [buf](ximu3::XIMU3_MagnetometerMessage m) {
+            buf->pushMagnetometer(m.timestamp, m.x, m.y, m.z);
+        };
+        entry->cb_lin_acc = [buf](ximu3::XIMU3_LinearAccelerationMessage m) {
+            buf->pushLinearAcceleration(m.timestamp, m.x, m.y, m.z);
+        };
+        entry->cb_sync = [buf](ximu3::XIMU3_SyncMessage m) {
+            buf->pushSync(m.timestamp, m.edge);
+        };
+        entry->cb_battery = [buf](ximu3::XIMU3_BatteryMessage m) {
+            buf->pushBattery(m.timestamp, m.percentage);
+        };
+        entry->cb_rssi = [buf](ximu3::XIMU3_RssiMessage m) {
+            buf->pushRssi(m.timestamp, m.percentage);
+        };
+
+        entry->connection->addQuaternionCallback(entry->cb_quat);
+        entry->connection->addEulerAnglesCallback(entry->cb_euler);
+        entry->connection->addInertialCallback(entry->cb_inertial);
+        entry->connection->addMagnetometerCallback(entry->cb_mag);
+        entry->connection->addLinearAccelerationCallback(entry->cb_lin_acc);
+        entry->connection->addSyncCallback(entry->cb_sync);
+        entry->connection->addBatteryCallback(entry->cb_battery);
+        entry->connection->addRssiCallback(entry->cb_rssi);
+
+        if (entry->connection->open() == ximu3::XIMU3_ResultOk) {
+            entry->connected = true;
+            ++ok_count;
+        } else {
+            entry->connection.reset();
+            entry->conn_config.reset();
+        }
+    }
+
+    return ok_count;
+}
+
+void ImuDeviceManager::disconnectAll() {
+    for (auto& entry : devices_) {
+        if (entry->connection) {
+            entry->connection->close();
+            entry->connection.reset();
+        }
+        entry->conn_config.reset();
+        entry->connected = false;
+    }
+}
+
+size_t ImuDeviceManager::connectedCount() const {
+    return static_cast<size_t>(std::count_if(
+        devices_.begin(), devices_.end(),
+        [](const auto& e) { return e->connected; }));
+}
+
+size_t ImuDeviceManager::deviceCount() const {
+    return devices_.size();
+}
+
+std::vector<ChannelDescriptor> ImuDeviceManager::getAllChannelDescriptors() const {
+    std::vector<ChannelDescriptor> all;
+    for (const auto& entry : devices_) {
+        auto desc = buildChannelDescriptors(entry->config.label, entry->config.channels);
+        all.insert(all.end(), desc.begin(), desc.end());
+    }
+    return all;
+}
+
+size_t ImuDeviceManager::totalChannelCount() const {
+    size_t total = 0;
+    for (const auto& entry : devices_) {
+        total += entry->buffer->channelCount();
+    }
+    return total;
+}
+
+void ImuDeviceManager::resetBuffers() {
+    shared_cursor_initialized_ = false;
+    shared_cursor_us_ = 0.0;
+    for (auto& entry : devices_) {
+        entry->buffer->clear();
+    }
+}
+
+bool ImuDeviceManager::readUniformFrames(double sample_rate_hz,
+                                         size_t num_frames,
+                                         ResampleMode mode,
+                                         std::vector<float>& out_interleaved) {
+    if (devices_.empty() || sample_rate_hz <= 0.0 || num_frames == 0) {
+        return false;
+    }
+
+    const size_t total_ch = totalChannelCount();
+    out_interleaved.assign(num_frames * total_ch, 0.0f);
+
+    // Find the slowest/most-conservative latest timestamp across all active IMUs
+    // so that all IMUs are sampled at the EXACT same synchronized network timestamp.
+    uint64_t min_latest_ts = UINT64_MAX;
+    bool any_data = false;
+    for (const auto& entry : devices_) {
+        const uint64_t ts = entry->buffer->latestTimestampUs();
+        if (ts > 0) {
+            min_latest_ts = std::min(min_latest_ts, ts);
+            any_data = true;
+        }
+    }
+
+    if (!any_data) {
+        return true;
+    }
+
+    constexpr double kJitterMarginUs = 25'000.0; // 25 ms anti-jitter buffer
+    constexpr double kMaxLagUs       = 150'000.0; // 150 ms max lag before catching up
+    const double step_us = 1'000'000.0 / sample_rate_hz;
+    const double batch_us = static_cast<double>(num_frames) * step_us;
+
+    if (!shared_cursor_initialized_) {
+        const double target_start = static_cast<double>(min_latest_ts) - batch_us - kJitterMarginUs;
+        shared_cursor_us_ = (target_start > 0.0) ? target_start : 0.0;
+        shared_cursor_initialized_ = true;
+    } else {
+        const double max_allowed = static_cast<double>(min_latest_ts);
+        if (shared_cursor_us_ + batch_us < max_allowed - kMaxLagUs) {
+            shared_cursor_us_ = max_allowed - kJitterMarginUs - batch_us;
+        }
+        if (shared_cursor_us_ > max_allowed) {
+            shared_cursor_us_ = max_allowed;
+        }
+        if (shared_cursor_us_ < 0.0) {
+            shared_cursor_us_ = 0.0;
+        }
+    }
+
+    for (size_t f = 0; f < num_frames; ++f) {
+        const uint64_t query_ts = static_cast<uint64_t>(
+            std::min(static_cast<double>(min_latest_ts), std::max(0.0, shared_cursor_us_)));
+
+        size_t ch_offset = 0;
+        for (const auto& entry : devices_) {
+            const size_t dev_ch = entry->buffer->channelCount();
+            std::vector<float> sample;
+            sample.reserve(dev_ch);
+            if (entry->buffer->sampleAt(query_ts, mode, sample)) {
+                for (size_t c = 0; c < dev_ch; ++c) {
+                    out_interleaved[f * total_ch + ch_offset + c] = sample[c];
+                }
+            }
+            ch_offset += dev_ch;
+        }
+
+        shared_cursor_us_ += step_us;
+    }
+
+    return true;
+}
+
+std::vector<SyncEvent> ImuDeviceManager::drainSyncEvents(size_t device_index) {
+    if (device_index >= devices_.size()) {
+        return {};
+    }
+    return devices_[device_index]->buffer->drainSyncEvents();
+}
+
+} // namespace qdevice_ximu3

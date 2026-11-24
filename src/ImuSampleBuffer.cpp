@@ -97,6 +97,24 @@ void ImuSampleBuffer::pushLinearAcceleration(uint64_t timestamp_us, float ax, fl
     recordSnapshotLocked(timestamp_us);
 }
 
+void ImuSampleBuffer::pushHighGAccelerometer(uint64_t timestamp_us, float ax, float ay, float az) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const HighGSample s{timestamp_us, ax, ay, az};
+    if (!high_g_history_.empty() && high_g_history_.back().timestamp_us == timestamp_us) {
+        high_g_history_.back() = s;
+    } else if (!high_g_history_.empty() && timestamp_us < high_g_history_.back().timestamp_us) {
+        auto it = std::lower_bound(
+            high_g_history_.begin(), high_g_history_.end(), timestamp_us,
+            [](const HighGSample& h, uint64_t ts) { return h.timestamp_us < ts; });
+        high_g_history_.insert(it, s);
+    } else {
+        high_g_history_.push_back(s);
+    }
+    while (high_g_history_.size() > max_high_g_history_) {
+        high_g_history_.pop_front();
+    }
+}
+
 void ImuSampleBuffer::pushSync(uint64_t timestamp_us, float edge) {
     std::lock_guard<std::mutex> lock(mutex_);
     // Update sync state & event log without injecting a stale inertial snapshot into history_.
@@ -125,6 +143,7 @@ void ImuSampleBuffer::pushRssi(uint64_t /*timestamp_us*/, float percentage) {
 void ImuSampleBuffer::clear() {
     std::lock_guard<std::mutex> lock(mutex_);
     history_.clear();
+    high_g_history_.clear();
     sync_history_.clear();
     sync_events_.clear();
     current_state_ = ImuStateSnapshot{};
@@ -135,6 +154,49 @@ void ImuSampleBuffer::clear() {
 uint64_t ImuSampleBuffer::latestTimestampUs() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return has_data_ ? current_state_.timestamp_us : 0;
+}
+
+uint64_t ImuSampleBuffer::latestHighGTimestampUs() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return high_g_history_.empty() ? 0 : high_g_history_.back().timestamp_us;
+}
+
+bool ImuSampleBuffer::sampleHighGAt(uint64_t query_timestamp_us,
+                                    ResampleMode mode,
+                                    float& out_x, float& out_y, float& out_z) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (high_g_history_.empty()) {
+        return false;
+    }
+    if (query_timestamp_us <= high_g_history_.front().timestamp_us) {
+        const auto& s = high_g_history_.front();
+        out_x = s.x; out_y = s.y; out_z = s.z;
+        return true;
+    }
+    if (query_timestamp_us >= high_g_history_.back().timestamp_us) {
+        const auto& s = high_g_history_.back();
+        out_x = s.x; out_y = s.y; out_z = s.z;
+        return true;
+    }
+    auto upper = std::lower_bound(
+        high_g_history_.begin(), high_g_history_.end(), query_timestamp_us,
+        [](const HighGSample& h, uint64_t ts) { return h.timestamp_us < ts; });
+    if (upper == high_g_history_.begin()) {
+        out_x = upper->x; out_y = upper->y; out_z = upper->z;
+        return true;
+    }
+    const auto lower = std::prev(upper);
+    if (mode == ResampleMode::ZeroOrderHold || upper->timestamp_us == lower->timestamp_us) {
+        out_x = lower->x; out_y = lower->y; out_z = lower->z;
+        return true;
+    }
+    const float t = static_cast<float>(
+        static_cast<double>(query_timestamp_us - lower->timestamp_us) /
+        static_cast<double>(upper->timestamp_us - lower->timestamp_us));
+    out_x = lower->x + (upper->x - lower->x) * t;
+    out_y = lower->y + (upper->y - lower->y) * t;
+    out_z = lower->z + (upper->z - lower->z) * t;
+    return true;
 }
 
 void ImuSampleBuffer::appendSnapshotToVector(const ImuStateSnapshot& snap, std::vector<float>& out) const {

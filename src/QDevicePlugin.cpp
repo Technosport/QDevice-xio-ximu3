@@ -30,15 +30,17 @@ using clock_t_qd = std::chrono::steady_clock;
 constexpr const char* INTEGRATION_NAME    = "xio Technologies xIMU3";
 constexpr const char* INTEGRATION_DESC    = "Wireless & USB IMU integration for x-io x-IMU3 (AHRS + Inertial + BNC Sync)";
 constexpr const char* INTEGRATION_URL     = "https://x-io.co.uk/x-imu3/";
-constexpr const char* INTEGRATION_VERSION = "0.1.2";
+constexpr const char* INTEGRATION_VERSION = "0.2.0";
 
 struct PluginState {
     std::mutex mutex;
     qd_state state = qd_state_disconnected;
     float sample_rate_hz = 400.0f;
+    float high_g_sample_rate_hz = 3200.0f;
     std::int32_t discovery_timeout_ms = 1200;
     bool include_euler = false;
-    bool include_magnetometer = false;
+    bool include_high_g = false;
+    bool include_magnetometer = true;
     bool include_linear_accel = false;
     bool include_diagnostics = true;
     bool require_bnc_sync = false;
@@ -53,6 +55,7 @@ struct PluginState {
     clock_t_qd::time_point stream_start_time{};
     std::optional<clock_t_qd::time_point> stream_stop_time{};
     std::uint64_t samples_read = 0;
+    std::uint64_t high_g_samples_read = 0;
     std::string last_error;
 };
 
@@ -132,7 +135,9 @@ void rebuildDevicesLocked(PluginState& st) {
         // Swap send/receive ports: announcement's udp_receive is where the IMU listens, udp_send is where it transmits.
         cfg.send_port     = d.udp_receive_port;
         cfg.receive_port  = d.udp_send_port;
-        cfg.channels      = groups;
+        cfg.channels       = groups;
+        cfg.enable_high_g  = st.include_high_g && !is_sync_only;
+        cfg.high_g_rate_hz = st.high_g_sample_rate_hz;
         st.manager.addDevice(cfg);
 
         const size_t ch_count = qdevice_ximu3::buildChannelDescriptors("", groups).size();
@@ -157,7 +162,9 @@ qd_call_status QD_STDCALL actionLocateDevices(const struct qd_configuration* con
     if (config) {
         try {
             QDevice::Utilities::try_assign_property_value("Sample Rate Hz", config->properties, st.sample_rate_hz);
+            QDevice::Utilities::try_assign_property_value("High-G Sample Rate Hz", config->properties, st.high_g_sample_rate_hz);
             QDevice::Utilities::try_assign_property_value("Discovery Timeout Ms", config->properties, st.discovery_timeout_ms);
+            QDevice::Utilities::try_assign_property_value("Include High-G Accel", config->properties, st.include_high_g);
             QDevice::Utilities::try_assign_property_value("Include Magnetometer", config->properties, st.include_magnetometer);
             QDevice::Utilities::try_assign_property_value("Include Diagnostics", config->properties, st.include_diagnostics);
             QDevice::Utilities::try_assign_property_value("Require BNC Hardware Sync", config->properties, st.require_bnc_sync);
@@ -247,7 +254,7 @@ qd_call_status qd_get_configuration(struct qd_configuration* configuration) {
         rebuildDevicesLocked(st);
     }
 
-    *configuration = QDevice::Utilities::create_configuration(5, st.discovered.size());
+    *configuration = QDevice::Utilities::create_configuration(7, st.discovered.size());
 
     configuration->properties.data[0] = QDevice::Utilities::create_property(
         "Sample Rate Hz",
@@ -258,6 +265,14 @@ qd_call_status qd_get_configuration(struct qd_configuration* configuration) {
         "");
 
     configuration->properties.data[1] = QDevice::Utilities::create_property(
+        "High-G Sample Rate Hz",
+        false,
+        qd_property_type_float32,
+        std::to_string(st.high_g_sample_rate_hz),
+        "3200",
+        "");
+
+    configuration->properties.data[2] = QDevice::Utilities::create_property(
         "Discovery Timeout Ms",
         false,
         qd_property_type_int32,
@@ -265,15 +280,19 @@ qd_call_status qd_get_configuration(struct qd_configuration* configuration) {
         "1200",
         "");
 
-    configuration->properties.data[2] = QDevice::Utilities::create_property(
-        "Include Magnetometer", false, qd_property_type_boolean,
-        st.include_magnetometer ? "true" : "false", "false", "");
-
     configuration->properties.data[3] = QDevice::Utilities::create_property(
+        "Include High-G Accel", false, qd_property_type_boolean,
+        st.include_high_g ? "true" : "false", "false", "");
+
+    configuration->properties.data[4] = QDevice::Utilities::create_property(
+        "Include Magnetometer", false, qd_property_type_boolean,
+        st.include_magnetometer ? "true" : "false", "true", "");
+
+    configuration->properties.data[5] = QDevice::Utilities::create_property(
         "Include Diagnostics", false, qd_property_type_boolean,
         st.include_diagnostics ? "true" : "false", "true", "");
 
-    configuration->properties.data[4] = QDevice::Utilities::create_property(
+    configuration->properties.data[6] = QDevice::Utilities::create_property(
         "Require BNC Hardware Sync", false, qd_property_type_boolean,
         st.require_bnc_sync ? "true" : "false", "false", "");
 
@@ -281,11 +300,13 @@ qd_call_status qd_get_configuration(struct qd_configuration* configuration) {
         const auto& dev = st.discovered[d];
         const std::string serial = deviceSerial(dev, d);
         const bool is_sync_only = (st.sync_only_serials.count(serial) > 0);
-        const size_t ch_offset = st.device_ch_offsets[d];
-        const size_t ch_count  = st.device_ch_counts[d];
+        const bool has_high_g   = st.include_high_g && !is_sync_only;
+        const size_t ch_offset  = st.device_ch_offsets[d];
+        const size_t ch_count   = st.device_ch_counts[d];
+        const size_t total_dev_ch = ch_count + (has_high_g ? 3 : 0);
 
         configuration->devices.data[d] = QDevice::Utilities::create_device(
-            qd_device_category_imu, serial, ch_count, 2);
+            qd_device_category_imu, serial, total_dev_ch, 2);
 
         const std::string endpoint = (dev.transport == qdevice_ximu3::TransportType::Usb)
             ? dev.port_name
@@ -305,6 +326,15 @@ qd_call_status qd_get_configuration(struct qd_configuration* configuration) {
                 qd_sample_encoding_float32,
                 toQdUnit(ch.unit),
                 st.sample_rate_hz);
+        }
+
+        if (has_high_g) {
+            configuration->devices.data[d].channels.data[ch_count + 0] = QDevice::Utilities::create_channel(
+                "HighG Acc X", qd_sample_encoding_float32, qd_channel_unit_g_forces, st.high_g_sample_rate_hz);
+            configuration->devices.data[d].channels.data[ch_count + 1] = QDevice::Utilities::create_channel(
+                "HighG Acc Y", qd_sample_encoding_float32, qd_channel_unit_g_forces, st.high_g_sample_rate_hz);
+            configuration->devices.data[d].channels.data[ch_count + 2] = QDevice::Utilities::create_channel(
+                "HighG Acc Z", qd_sample_encoding_float32, qd_channel_unit_g_forces, st.high_g_sample_rate_hz);
         }
     }
 
@@ -326,7 +356,9 @@ qd_call_status qd_connect(const struct qd_configuration* config) {
 
     try {
         QDevice::Utilities::try_assign_property_value("Sample Rate Hz", config->properties, st.sample_rate_hz);
+        QDevice::Utilities::try_assign_property_value("High-G Sample Rate Hz", config->properties, st.high_g_sample_rate_hz);
         QDevice::Utilities::try_assign_property_value("Discovery Timeout Ms", config->properties, st.discovery_timeout_ms);
+        QDevice::Utilities::try_assign_property_value("Include High-G Accel", config->properties, st.include_high_g);
         QDevice::Utilities::try_assign_property_value("Include Magnetometer", config->properties, st.include_magnetometer);
         QDevice::Utilities::try_assign_property_value("Include Diagnostics", config->properties, st.include_diagnostics);
         QDevice::Utilities::try_assign_property_value("Require BNC Hardware Sync", config->properties, st.require_bnc_sync);
@@ -401,6 +433,7 @@ qd_call_status qd_start_streaming() {
     st.stream_start_time = clock_t_qd::now();
     st.stream_stop_time.reset();
     st.samples_read = 0;
+    st.high_g_samples_read = 0;
     st.state = qd_state_streaming;
     return okStatus();
 }
@@ -444,53 +477,91 @@ qd_call_status qd_read_samples(qd_sample_push_fn callback) {
         return errorStatus("BNC Hardware Sync error: no BNC sync signal received within 2.5s. Check BNC cable and QTM Synchronization -> Sync Out (use Camera Frequency), or uncheck 'Require BNC Hardware Sync'.");
     }
     const auto target_total = static_cast<std::uint64_t>(std::max(0.0, elapsed_sec * static_cast<double>(st.sample_rate_hz)));
+    const auto high_g_target = st.include_high_g
+        ? static_cast<std::uint64_t>(std::max(0.0, elapsed_sec * static_cast<double>(st.high_g_sample_rate_hz)))
+        : 0;
 
-    if (target_total <= st.samples_read) {
+    const size_t num_frames = (target_total > st.samples_read)
+        ? static_cast<size_t>(target_total - st.samples_read)
+        : 0;
+    const size_t high_g_frames = (st.include_high_g && high_g_target > st.high_g_samples_read)
+        ? static_cast<size_t>(high_g_target - st.high_g_samples_read)
+        : 0;
+
+    const size_t total_ch = st.channels.size();
+    if (total_ch == 0 || st.discovered.empty()) {
         if (st.state != qd_state_streaming) {
             st.stream_stop_time.reset();
         }
         return okStatus();
     }
 
-    const auto num_frames = static_cast<size_t>(target_total - st.samples_read);
-    const size_t total_ch = st.channels.size();
-    if (total_ch == 0 || st.discovered.empty()) {
-        return okStatus();
-    }
+    if (num_frames > 0) {
+        std::vector<float> interleaved;
+        if (st.manager.readUniformFrames(
+                static_cast<double>(st.sample_rate_hz),
+                num_frames,
+                qdevice_ximu3::ResampleMode::Linear,
+                interleaved)) {
+            std::vector<float> ch_buf(num_frames);
 
-    std::vector<float> interleaved;
-    if (!st.manager.readUniformFrames(
-            static_cast<double>(st.sample_rate_hz),
-            num_frames,
-            qdevice_ximu3::ResampleMode::Linear,
-            interleaved)) {
-        return okStatus();
-    }
+            for (size_t d = 0; d < st.discovered.size(); ++d) {
+                const std::string serial = deviceSerial(st.discovered[d], d);
+                const size_t ch_offset = st.device_ch_offsets[d];
+                const size_t ch_count  = st.device_ch_counts[d];
 
-    std::vector<float> ch_buf(num_frames);
+                for (size_t c = 0; c < ch_count; ++c) {
+                    const size_t global_ch = ch_offset + c;
+                    for (size_t f = 0; f < num_frames; ++f) {
+                        ch_buf[f] = interleaved[f * total_ch + global_ch];
+                    }
 
-    for (size_t d = 0; d < st.discovered.size(); ++d) {
-        const std::string serial = deviceSerial(st.discovered[d], d);
-        const size_t ch_offset = st.device_ch_offsets[d];
-        const size_t ch_count  = st.device_ch_counts[d];
+                    qd_samples samples{};
+                    samples.start_sample_number = st.samples_read;
+                    samples.encoding            = qd_sample_encoding_float32;
+                    samples.data                = reinterpret_cast<std::uint8_t*>(ch_buf.data());
+                    samples.size                = num_frames;
 
-        for (size_t c = 0; c < ch_count; ++c) {
-            const size_t global_ch = ch_offset + c;
-            for (size_t f = 0; f < num_frames; ++f) {
-                ch_buf[f] = interleaved[f * total_ch + global_ch];
+                    callback(serial.c_str(), st.channels[global_ch].name.c_str(), samples);
+                }
             }
-
-            qd_samples samples{};
-            samples.start_sample_number = st.samples_read;
-            samples.encoding            = qd_sample_encoding_float32;
-            samples.data                = reinterpret_cast<std::uint8_t*>(ch_buf.data());
-            samples.size                = num_frames;
-
-            callback(serial.c_str(), st.channels[global_ch].name.c_str(), samples);
+            st.samples_read += num_frames;
         }
     }
 
-    st.samples_read += num_frames;
+    if (high_g_frames > 0) {
+        std::vector<float> hg_interleaved;
+        if (st.manager.readUniformHighGFrames(
+                static_cast<double>(st.high_g_sample_rate_hz),
+                high_g_frames,
+                qdevice_ximu3::ResampleMode::Linear,
+                hg_interleaved)) {
+            static constexpr const char* kHighGNames[3] = { "HighG Acc X", "HighG Acc Y", "HighG Acc Z" };
+            const size_t stride = st.discovered.size() * 3;
+            std::vector<float> hg_buf(high_g_frames);
+
+            for (size_t d = 0; d < st.discovered.size(); ++d) {
+                const std::string serial = deviceSerial(st.discovered[d], d);
+                if (st.sync_only_serials.count(serial) > 0) continue;
+
+                for (size_t axis = 0; axis < 3; ++axis) {
+                    for (size_t f = 0; f < high_g_frames; ++f) {
+                        hg_buf[f] = hg_interleaved[f * stride + d * 3 + axis];
+                    }
+
+                    qd_samples samples{};
+                    samples.start_sample_number = st.high_g_samples_read;
+                    samples.encoding            = qd_sample_encoding_float32;
+                    samples.data                = reinterpret_cast<std::uint8_t*>(hg_buf.data());
+                    samples.size                = high_g_frames;
+
+                    callback(serial.c_str(), kHighGNames[axis], samples);
+                }
+            }
+            st.high_g_samples_read += high_g_frames;
+        }
+    }
+
     if (st.state != qd_state_streaming) {
         st.stream_stop_time.reset();
     }

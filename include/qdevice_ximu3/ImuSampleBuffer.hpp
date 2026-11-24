@@ -41,6 +41,13 @@ struct SyncEvent {
     float edge = 0.0f;
 };
 
+struct HighGSample {
+    uint64_t timestamp_us = 0;
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+};
+
 /// Thread-safe per-IMU buffer that ingests asynchronous x-IMU3 callbacks and
 /// resamples them onto a uniform QTM sample grid (e.g. 100 Hz, 200 Hz, 400 Hz).
 class ImuSampleBuffer {
@@ -60,6 +67,7 @@ public:
                       float ax, float ay, float az);
     void pushMagnetometer(uint64_t timestamp_us, float mx, float my, float mz);
     void pushLinearAcceleration(uint64_t timestamp_us, float ax, float ay, float az);
+    void pushHighGAccelerometer(uint64_t timestamp_us, float ax, float ay, float az);
     void pushSync(uint64_t timestamp_us, float edge);
     void pushBattery(uint64_t timestamp_us, float percentage);
     void pushRssi(uint64_t timestamp_us, float percentage);
@@ -69,6 +77,14 @@ public:
 
     /// Returns the latest snapshot timestamp in microseconds, or 0 if empty.
     uint64_t latestTimestampUs() const;
+
+    /// Returns the latest High-G accelerometer timestamp in microseconds, or 0 if empty.
+    uint64_t latestHighGTimestampUs() const;
+
+    /// Samples the High-G accelerometer buffer at a specific IMU timestamp (in microseconds).
+    bool sampleHighGAt(uint64_t query_timestamp_us,
+                       ResampleMode mode,
+                       float& out_x, float& out_y, float& out_z) const;
 
     /// Samples the buffer at a specific IMU timestamp (in microseconds).
     /// Returns false if no data has been received yet.
@@ -106,6 +122,8 @@ private:
     bool has_data_ = false;
     uint64_t sync_events_received_ = 0;
     std::deque<ImuStateSnapshot> history_;
+    std::deque<HighGSample> high_g_history_;
+    size_t max_high_g_history_ = 16384;
     std::deque<SyncEvent> sync_history_;
     std::vector<SyncEvent> sync_events_;
 };

@@ -22,6 +22,7 @@ struct ImuDeviceManager::DeviceEntry {
     std::function<void(ximu3::XIMU3_InertialMessage)> cb_inertial;
     std::function<void(ximu3::XIMU3_MagnetometerMessage)> cb_mag;
     std::function<void(ximu3::XIMU3_LinearAccelerationMessage)> cb_lin_acc;
+    std::function<void(ximu3::XIMU3_HighGAccelerometerMessage)> cb_high_g;
     std::function<void(ximu3::XIMU3_SyncMessage)> cb_sync;
     std::function<void(ximu3::XIMU3_BatteryMessage)> cb_battery;
     std::function<void(ximu3::XIMU3_RssiMessage)> cb_rssi;
@@ -139,6 +140,9 @@ size_t ImuDeviceManager::connectAll() {
         entry->cb_lin_acc = [buf](ximu3::XIMU3_LinearAccelerationMessage m) {
             buf->pushLinearAcceleration(m.timestamp, m.x, m.y, m.z);
         };
+        entry->cb_high_g = [buf](ximu3::XIMU3_HighGAccelerometerMessage m) {
+            buf->pushHighGAccelerometer(m.timestamp, m.x, m.y, m.z);
+        };
         entry->cb_sync = [buf](ximu3::XIMU3_SyncMessage m) {
             buf->pushSync(m.timestamp, m.edge);
         };
@@ -154,6 +158,7 @@ size_t ImuDeviceManager::connectAll() {
         entry->connection->addInertialCallback(entry->cb_inertial);
         entry->connection->addMagnetometerCallback(entry->cb_mag);
         entry->connection->addLinearAccelerationCallback(entry->cb_lin_acc);
+        entry->connection->addHighGAccelerometerCallback(entry->cb_high_g);
         entry->connection->addSyncCallback(entry->cb_sync);
         entry->connection->addBatteryCallback(entry->cb_battery);
         entry->connection->addRssiCallback(entry->cb_rssi);
@@ -167,6 +172,28 @@ size_t ImuDeviceManager::connectAll() {
                 // this PC's IP and starts streaming UDP data right away.
                 entry->connection->ping();
             }
+            // Configure sensor message rates to hardware maximums (400 Hz Inertial/AHRS,
+            // 20 Hz Mag, 5 Hz Battery, 1 Hz RSSI, and 3200 Hz High-G when enabled).
+            int high_g_div = 0;
+            if (entry->config.enable_high_g) {
+                const float r = entry->config.high_g_rate_hz;
+                if (r >= 2400.0f)      high_g_div = 1; // 3200 Hz
+                else if (r >= 1200.0f) high_g_div = 2; // 1600 Hz
+                else if (r >= 600.0f)  high_g_div = 4; // 800 Hz
+                else                   high_g_div = 8; // 400 Hz
+            }
+            std::vector<std::string> rate_cmds = {
+                "{\"inertial_message_rate_divisor\":1}",
+                "{\"ahrs_message_rate_divisor\":1}",
+                "{\"magnetometer_message_rate_divisor\":1}",
+                "{\"battery_message_rate_divisor\":1}",
+                "{\"rssi_message_rate_divisor\":1}",
+                "{\"high_g_accelerometer_message_rate_divisor\":" + std::to_string(high_g_div) + "}"
+            };
+            entry->connection->sendCommandsAsync(
+                rate_cmds,
+                [](const std::vector<std::optional<ximu3::CommandMessage>>&) {},
+                1, 250);
         } else {
             entry->connection.reset();
             entry->conn_config.reset();
@@ -217,6 +244,8 @@ size_t ImuDeviceManager::totalChannelCount() const {
 void ImuDeviceManager::resetBuffers() {
     shared_cursor_initialized_ = false;
     shared_cursor_us_ = 0.0;
+    high_g_cursor_initialized_ = false;
+    high_g_cursor_us_ = 0.0;
     for (auto& entry : devices_) {
         entry->buffer->clear();
         if (entry->connected && entry->connection && entry->config.transport == TransportType::Udp) {
@@ -292,6 +321,74 @@ bool ImuDeviceManager::readUniformFrames(double sample_rate_hz,
         }
 
         shared_cursor_us_ += step_us;
+    }
+
+    return true;
+}
+
+bool ImuDeviceManager::readUniformHighGFrames(double high_g_rate_hz,
+                                              size_t num_frames,
+                                              ResampleMode mode,
+                                              std::vector<float>& out_interleaved) {
+    if (devices_.empty() || high_g_rate_hz <= 0.0 || num_frames == 0) {
+        return false;
+    }
+
+    const size_t stride = devices_.size() * 3;
+    out_interleaved.assign(num_frames * stride, 0.0f);
+
+    uint64_t min_latest_ts = UINT64_MAX;
+    bool any_data = false;
+    for (const auto& entry : devices_) {
+        if (!entry->config.enable_high_g) continue;
+        const uint64_t ts = entry->buffer->latestHighGTimestampUs();
+        if (ts > 0) {
+            min_latest_ts = std::min(min_latest_ts, ts);
+            any_data = true;
+        }
+    }
+
+    if (!any_data) {
+        return true;
+    }
+
+    constexpr double kJitterMarginUs = 25'000.0;
+    constexpr double kMaxLagUs       = 150'000.0;
+    const double step_us = 1'000'000.0 / high_g_rate_hz;
+    const double batch_us = static_cast<double>(num_frames) * step_us;
+
+    if (!high_g_cursor_initialized_) {
+        const double target_start = static_cast<double>(min_latest_ts) - batch_us - kJitterMarginUs;
+        high_g_cursor_us_ = (target_start > 0.0) ? target_start : 0.0;
+        high_g_cursor_initialized_ = true;
+    } else {
+        const double max_allowed = static_cast<double>(min_latest_ts);
+        if (high_g_cursor_us_ + batch_us < max_allowed - kMaxLagUs) {
+            high_g_cursor_us_ = max_allowed - kJitterMarginUs - batch_us;
+        }
+        if (high_g_cursor_us_ > max_allowed) {
+            high_g_cursor_us_ = max_allowed;
+        }
+        if (high_g_cursor_us_ < 0.0) {
+            high_g_cursor_us_ = 0.0;
+        }
+    }
+
+    for (size_t f = 0; f < num_frames; ++f) {
+        const uint64_t query_ts = static_cast<uint64_t>(
+            std::min(static_cast<double>(min_latest_ts), std::max(0.0, high_g_cursor_us_)));
+
+        for (size_t d = 0; d < devices_.size(); ++d) {
+            if (!devices_[d]->config.enable_high_g) continue;
+            float gx = 0.0f, gy = 0.0f, gz = 0.0f;
+            if (devices_[d]->buffer->sampleHighGAt(query_ts, mode, gx, gy, gz)) {
+                out_interleaved[f * stride + d * 3 + 0] = gx;
+                out_interleaved[f * stride + d * 3 + 1] = gy;
+                out_interleaved[f * stride + d * 3 + 2] = gz;
+            }
+        }
+
+        high_g_cursor_us_ += step_us;
     }
 
     return true;

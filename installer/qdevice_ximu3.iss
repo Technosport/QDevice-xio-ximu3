@@ -1,5 +1,5 @@
 #define MyAppName "QDevice x-IMU3 for QTM"
-#define MyAppVersion "0.1.2"
+#define MyAppVersion "0.2.0"
 #define MyAppPublisher "Technosport"
 #define MyAppURL "https://github.com/Technosport/QDevice-xio-ximu3"
 

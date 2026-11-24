@@ -39,6 +39,8 @@ struct ManagedImuConfig {
     uint16_t send_port = 0;   // UDP send port or TCP port
     uint16_t receive_port = 0;// UDP receive port
     ChannelGroup channels = ChannelGroup::DefaultBiomechanics;
+    bool enable_high_g = false;
+    float high_g_rate_hz = 3200.0f;
 };
 
 /// Manages discovery, connection, and multi-sensor streaming for N x-IMU3 units.
@@ -81,6 +83,13 @@ public:
                            ResampleMode mode,
                            std::vector<float>& out_interleaved);
 
+    /// Samples High-G accelerometer (X, Y, Z) across all IMUs at `high_g_rate_hz`.
+    /// Outputs `num_frames * deviceCount() * 3` floats in frame-major, device-major order.
+    bool readUniformHighGFrames(double high_g_rate_hz,
+                                size_t num_frames,
+                                ResampleMode mode,
+                                std::vector<float>& out_interleaved);
+
     /// Drains hardware sync events (BNC Sync Accessory) for a given device index.
     std::vector<SyncEvent> drainSyncEvents(size_t device_index);
 
@@ -95,6 +104,8 @@ private:
     std::vector<std::unique_ptr<DeviceEntry>> devices_;
     bool shared_cursor_initialized_ = false;
     double shared_cursor_us_ = 0.0;
+    bool high_g_cursor_initialized_ = false;
+    double high_g_cursor_us_ = 0.0;
 };
 
 } // namespace qdevice_ximu3

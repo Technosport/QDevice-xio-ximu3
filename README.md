@@ -23,9 +23,10 @@
 | Channel / Option | Description |
 | :--- | :--- |
 | **`Quat W / X / Y / Z`** (`400 Hz`) | Quaternion orientation |
-| **`Gyro X / Y / Z`** (`deg/s`) & **`Acc X / Y / Z`** (`g`) | Inertial measurements |
+| **`Gyro X / Y / Z`** (`deg/s`) & **`Acc X / Y / Z`** (`g`, `400 Hz`) | Inertial measurements (`±16 g`) |
+| **`HighG Acc X / Y / Z`** (`g`, up to `3200 Hz`) | Optional High-G accelerometer (`±24 g`, `Include High-G Accel`, disabled by default, configurable via `High-G Sample Rate Hz`) |
+| **`Mag X / Y / Z`** (`uT`, `20 Hz` native) | Magnetometer (`Include Magnetometer`, enabled by default) |
 | **`Sync Edge`** (`0 / 1`) | Hardware BNC sync edges (`serial_mode = 4`, firmware `v2.6.0+`) |
 | **`Battery Pct`** & **`Rssi Pct`** (`%`) | Battery level and Wi-Fi signal strength (`Include Diagnostics`, enabled by default) |
-| **`Mag X / Y / Z`** (`uT`, optional) | Magnetometer (`Include Magnetometer`) |
 | **`Sync Only`** *(per IMU)* | Expose only `Sync Edge` on the base sync IMU |
 | **`Require BNC Hardware Sync`** | Enforce hardware BNC sync and raise an error if missing (unchecked = Wi-Fi sync) |

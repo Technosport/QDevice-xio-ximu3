@@ -88,6 +88,9 @@ public:
     /// Returns and clears recorded hardware sync events (for clock offset / drift tracking).
     std::vector<SyncEvent> drainSyncEvents();
 
+    /// Total number of hardware sync events received since the last clear().
+    uint64_t syncEventsReceived() const;
+
 private:
     float syncEdgeAtLocked(uint64_t query_timestamp_us) const;
     void recordSnapshotLocked(uint64_t timestamp_us);
@@ -101,6 +104,7 @@ private:
     size_t max_history_;
     ImuStateSnapshot current_state_{};
     bool has_data_ = false;
+    uint64_t sync_events_received_ = 0;
     std::deque<ImuStateSnapshot> history_;
     std::deque<SyncEvent> sync_history_;
     std::vector<SyncEvent> sync_events_;

@@ -101,6 +101,7 @@ void ImuSampleBuffer::pushSync(uint64_t timestamp_us, float edge) {
     std::lock_guard<std::mutex> lock(mutex_);
     // Update sync state & event log without injecting a stale inertial snapshot into history_.
     current_state_.sync_edge = edge;
+    ++sync_events_received_;
     sync_events_.push_back({timestamp_us, edge});
     sync_history_.push_back({timestamp_us, edge});
     while (sync_history_.size() > max_history_) {
@@ -128,6 +129,7 @@ void ImuSampleBuffer::clear() {
     sync_events_.clear();
     current_state_ = ImuStateSnapshot{};
     has_data_ = false;
+    sync_events_received_ = 0;
 }
 
 uint64_t ImuSampleBuffer::latestTimestampUs() const {
@@ -302,6 +304,11 @@ std::vector<SyncEvent> ImuSampleBuffer::drainSyncEvents() {
     std::vector<SyncEvent> events;
     events.swap(sync_events_);
     return events;
+}
+
+uint64_t ImuSampleBuffer::syncEventsReceived() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return sync_events_received_;
 }
 
 } // namespace qdevice_ximu3

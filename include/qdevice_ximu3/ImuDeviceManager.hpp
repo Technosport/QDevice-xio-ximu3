@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -82,6 +83,12 @@ public:
 
     /// Drains hardware sync events (BNC Sync Accessory) for a given device index.
     std::vector<SyncEvent> drainSyncEvents(size_t device_index);
+
+    /// Total hardware sync events received across all devices since last resetBuffers().
+    uint64_t totalSyncEventsReceived() const;
+
+    /// Queries the sensor's `serial_mode` setting (4 = Sync). Returns nullopt if unreachable.
+    std::optional<int> querySerialMode(size_t device_index) const;
 
 private:
     struct DeviceEntry;

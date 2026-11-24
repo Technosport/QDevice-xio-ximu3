@@ -161,6 +161,12 @@ size_t ImuDeviceManager::connectAll() {
         if (entry->connection->open() == ximu3::XIMU3_ResultOk) {
             entry->connected = true;
             ++ok_count;
+            if (entry->config.transport == TransportType::Udp) {
+                // Firmware v2.6.0+ defaults udp_ip_address to "0.0.0.0" (auto-detect host IP
+                // on first incoming UDP packet). Ping immediately so the sensor locks onto
+                // this PC's IP and starts streaming UDP data right away.
+                entry->connection->ping();
+            }
         } else {
             entry->connection.reset();
             entry->conn_config.reset();
@@ -213,6 +219,9 @@ void ImuDeviceManager::resetBuffers() {
     shared_cursor_us_ = 0.0;
     for (auto& entry : devices_) {
         entry->buffer->clear();
+        if (entry->connected && entry->connection && entry->config.transport == TransportType::Udp) {
+            entry->connection->pingAsync([](std::optional<ximu3::XIMU3_PingResponse>) {});
+        }
     }
 }
 
@@ -293,6 +302,30 @@ std::vector<SyncEvent> ImuDeviceManager::drainSyncEvents(size_t device_index) {
         return {};
     }
     return devices_[device_index]->buffer->drainSyncEvents();
+}
+
+uint64_t ImuDeviceManager::totalSyncEventsReceived() const {
+    uint64_t total = 0;
+    for (const auto& entry : devices_) {
+        total += entry->buffer->syncEventsReceived();
+    }
+    return total;
+}
+
+std::optional<int> ImuDeviceManager::querySerialMode(size_t device_index) const {
+    if (device_index >= devices_.size() || !devices_[device_index]->connected ||
+        !devices_[device_index]->connection) {
+        return std::nullopt;
+    }
+    const auto resp = devices_[device_index]->connection->sendCommand("{\"serial_mode\":null}", 2, 250);
+    if (!resp.has_value() || resp->error.has_value() || resp->value.empty()) {
+        return std::nullopt;
+    }
+    try {
+        return std::stoi(resp->value);
+    } catch (...) {
+        return std::nullopt;
+    }
 }
 
 } // namespace qdevice_ximu3

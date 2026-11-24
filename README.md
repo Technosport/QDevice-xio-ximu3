@@ -29,4 +29,4 @@
 | **`Sync Edge`** (`0 / 1`) | Hardware BNC sync edges (`serial_mode = 4`, firmware `v2.6.0+`) |
 | **`Battery Pct`** & **`Rssi Pct`** (`%`) | Battery level and Wi-Fi signal strength (`Include Diagnostics`, enabled by default) |
 | **`Sync Only`** *(per IMU)* | Expose only `Sync Edge` on the base sync IMU |
-| **`Require BNC Hardware Sync`** | Enforce hardware BNC sync and raise an error if missing (unchecked = Wi-Fi sync) |
+| **`BNC Hardware Sync`** / **`Wi-Fi Software Sync`** | Exclusive sync mode selection (raises an error if both/neither are checked, or if BNC sync signal is missing) |

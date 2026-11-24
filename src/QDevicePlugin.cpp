@@ -30,7 +30,7 @@ using clock_t_qd = std::chrono::steady_clock;
 constexpr const char* INTEGRATION_NAME    = "xio Technologies xIMU3";
 constexpr const char* INTEGRATION_DESC    = "Wireless & USB IMU integration for x-io x-IMU3 (AHRS + Inertial + BNC Sync)";
 constexpr const char* INTEGRATION_URL     = "https://x-io.co.uk/x-imu3/";
-constexpr const char* INTEGRATION_VERSION = "0.2.0";
+constexpr const char* INTEGRATION_VERSION = "0.2.1";
 
 struct PluginState {
     std::mutex mutex;
@@ -43,7 +43,8 @@ struct PluginState {
     bool include_magnetometer = true;
     bool include_linear_accel = false;
     bool include_diagnostics = true;
-    bool require_bnc_sync = false;
+    bool bnc_hardware_sync = false;
+    bool wifi_software_sync = true;
 
     qdevice_ximu3::ImuDeviceManager manager;
     std::vector<qdevice_ximu3::DiscoveredImu> discovered;
@@ -167,7 +168,8 @@ qd_call_status QD_STDCALL actionLocateDevices(const struct qd_configuration* con
             QDevice::Utilities::try_assign_property_value("Include High-G Accel", config->properties, st.include_high_g);
             QDevice::Utilities::try_assign_property_value("Include Magnetometer", config->properties, st.include_magnetometer);
             QDevice::Utilities::try_assign_property_value("Include Diagnostics", config->properties, st.include_diagnostics);
-            QDevice::Utilities::try_assign_property_value("Require BNC Hardware Sync", config->properties, st.require_bnc_sync);
+            QDevice::Utilities::try_assign_property_value("BNC Hardware Sync", config->properties, st.bnc_hardware_sync);
+            QDevice::Utilities::try_assign_property_value("Wi-Fi Software Sync", config->properties, st.wifi_software_sync);
         } catch (...) {}
     }
     applyDevicePropertiesLocked(st, config);
@@ -254,7 +256,7 @@ qd_call_status qd_get_configuration(struct qd_configuration* configuration) {
         rebuildDevicesLocked(st);
     }
 
-    *configuration = QDevice::Utilities::create_configuration(7, st.discovered.size());
+    *configuration = QDevice::Utilities::create_configuration(8, st.discovered.size());
 
     configuration->properties.data[0] = QDevice::Utilities::create_property(
         "Sample Rate Hz",
@@ -293,8 +295,12 @@ qd_call_status qd_get_configuration(struct qd_configuration* configuration) {
         st.include_diagnostics ? "true" : "false", "true", "");
 
     configuration->properties.data[6] = QDevice::Utilities::create_property(
-        "Require BNC Hardware Sync", false, qd_property_type_boolean,
-        st.require_bnc_sync ? "true" : "false", "false", "");
+        "BNC Hardware Sync", false, qd_property_type_boolean,
+        st.bnc_hardware_sync ? "true" : "false", "false", "");
+
+    configuration->properties.data[7] = QDevice::Utilities::create_property(
+        "Wi-Fi Software Sync", false, qd_property_type_boolean,
+        st.wifi_software_sync ? "true" : "false", "true", "");
 
     for (size_t d = 0; d < st.discovered.size(); ++d) {
         const auto& dev = st.discovered[d];
@@ -361,10 +367,15 @@ qd_call_status qd_connect(const struct qd_configuration* config) {
         QDevice::Utilities::try_assign_property_value("Include High-G Accel", config->properties, st.include_high_g);
         QDevice::Utilities::try_assign_property_value("Include Magnetometer", config->properties, st.include_magnetometer);
         QDevice::Utilities::try_assign_property_value("Include Diagnostics", config->properties, st.include_diagnostics);
-        QDevice::Utilities::try_assign_property_value("Require BNC Hardware Sync", config->properties, st.require_bnc_sync);
+        QDevice::Utilities::try_assign_property_value("BNC Hardware Sync", config->properties, st.bnc_hardware_sync);
+        QDevice::Utilities::try_assign_property_value("Wi-Fi Software Sync", config->properties, st.wifi_software_sync);
         applyDevicePropertiesLocked(st, config);
     } catch (const std::exception& ex) {
         return errorStatus(std::string("Invalid configuration: ") + ex.what());
+    }
+
+    if (st.bnc_hardware_sync == st.wifi_software_sync) {
+        return errorStatus("Select exactly one sync mode: either 'BNC Hardware Sync' OR 'Wi-Fi Software Sync'.");
     }
 
     runDiscoveryLocked(st);
@@ -376,7 +387,7 @@ qd_call_status qd_connect(const struct qd_configuration* config) {
         return errorStatus("Failed to connect to any x-IMU3 device");
     }
 
-    if (st.require_bnc_sync) {
+    if (st.bnc_hardware_sync) {
         bool any_sync_mode = false;
         const bool has_sync_only = !st.sync_only_serials.empty();
         for (size_t d = 0; d < st.discovered.size(); ++d) {
@@ -391,12 +402,12 @@ qd_call_status qd_connect(const struct qd_configuration* config) {
             } else if (has_sync_only && is_sync_only) {
                 st.manager.disconnectAll();
                 return errorStatus("BNC Hardware Sync error: Sync Only device " + serial +
-                                   " does not have serial_mode = 4 (Sync). Configure it in x-IMU3 GUI or uncheck 'Require BNC Hardware Sync'.");
+                                   " does not have serial_mode = 4 (Sync). Configure it in x-IMU3 GUI or switch to Wi-Fi Software Sync.");
             }
         }
         if (!any_sync_mode) {
             st.manager.disconnectAll();
-            return errorStatus("BNC Hardware Sync error: no connected x-IMU3 has serial_mode = 4 (Sync). Enable Sync on the base IMU or uncheck 'Require BNC Hardware Sync'.");
+            return errorStatus("BNC Hardware Sync error: no connected x-IMU3 has serial_mode = 4 (Sync). Enable Sync on the base IMU or switch to Wi-Fi Software Sync.");
         }
     }
 
@@ -472,9 +483,9 @@ qd_call_status qd_read_samples(qd_sample_push_fn callback) {
     }
 
     const double elapsed_sec = std::chrono::duration<double>(effective_now - st.stream_start_time).count();
-    if (st.require_bnc_sync && st.state == qd_state_streaming &&
+    if (st.bnc_hardware_sync && st.state == qd_state_streaming &&
         elapsed_sec >= 2.5 && st.manager.totalSyncEventsReceived() == 0) {
-        return errorStatus("BNC Hardware Sync error: no BNC sync signal received within 2.5s. Check BNC cable and QTM Synchronization -> Sync Out (use Camera Frequency), or uncheck 'Require BNC Hardware Sync'.");
+        return errorStatus("BNC Hardware Sync error: no BNC sync signal received within 2.5s. Check BNC cable and QTM Synchronization -> Sync Out (use Camera Frequency), or switch to Wi-Fi Software Sync.");
     }
     const auto target_total = static_cast<std::uint64_t>(std::max(0.0, elapsed_sec * static_cast<double>(st.sample_rate_hz)));
     const auto high_g_target = st.include_high_g

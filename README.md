@@ -7,6 +7,8 @@
 > **Qualisys Track Manager integration plugin for x-io Technologies x-IMU3 sensors.**  
 > *Developed at **Technosport / ISM** (UMR 7287 CNRS — Aix-Marseille Université) • [**Releases**](../../releases)*
 
+![QTM x-IMU3 Preview](assets/qtm_preview.jpg)
+
 ---
 
 ## 🚀 Getting Started

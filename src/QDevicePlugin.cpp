@@ -30,7 +30,7 @@ using clock_t_qd = std::chrono::steady_clock;
 constexpr const char* INTEGRATION_NAME    = "xio Technologies xIMU3";
 constexpr const char* INTEGRATION_DESC    = "Wireless & USB IMU integration for x-io x-IMU3 (AHRS + Inertial + BNC Sync)";
 constexpr const char* INTEGRATION_URL     = "https://x-io.co.uk/x-imu3/";
-constexpr const char* INTEGRATION_VERSION = "0.1.1";
+constexpr const char* INTEGRATION_VERSION = "0.1.2";
 
 struct PluginState {
     std::mutex mutex;
@@ -153,6 +153,15 @@ qd_call_status QD_STDCALL actionLocateDevices(const struct qd_configuration* con
     std::lock_guard<std::mutex> lock(st.mutex);
     if (st.state != qd_state_disconnected) {
         return errorStatus("Disconnect before locating devices");
+    }
+    if (config) {
+        try {
+            QDevice::Utilities::try_assign_property_value("Sample Rate Hz", config->properties, st.sample_rate_hz);
+            QDevice::Utilities::try_assign_property_value("Discovery Timeout Ms", config->properties, st.discovery_timeout_ms);
+            QDevice::Utilities::try_assign_property_value("Include Magnetometer", config->properties, st.include_magnetometer);
+            QDevice::Utilities::try_assign_property_value("Include Diagnostics", config->properties, st.include_diagnostics);
+            QDevice::Utilities::try_assign_property_value("Require BNC Hardware Sync", config->properties, st.require_bnc_sync);
+        } catch (...) {}
     }
     applyDevicePropertiesLocked(st, config);
     runDiscoveryLocked(st);
@@ -482,5 +491,8 @@ qd_call_status qd_read_samples(qd_sample_push_fn callback) {
     }
 
     st.samples_read += num_frames;
+    if (st.state != qd_state_streaming) {
+        st.stream_stop_time.reset();
+    }
     return okStatus();
 }

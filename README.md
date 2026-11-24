@@ -12,7 +12,7 @@
 ## 🚀 Démarrage
 
 1. Fermer **Qualisys Track Manager (QTM)**.
-2. Télécharger et exécuter **`QDevice-xIMU3-Setup-v0.1.0.exe`** depuis les **[Releases](../../releases)**.
+2. Télécharger et exécuter **`QDevice-xIMU3-Setup-v0.1.2.exe`** depuis les **[Releases](../../releases)**.
 3. Ouvrir **QTM > Project Options > Input Devices > Add Device...** et activer **xio Technologies xIMU3**.
 4. Connecter les x-IMU3 au réseau Wi-Fi (ou en USB), puis dans **IMUs > xio Technologies xIMU3** cliquer sur **Locate Devices**, cocher **Sync Only** sur l'IMU dédié au câble BNC si besoin, puis **Synchronize Settings** et **OK**.
 
@@ -26,6 +26,8 @@
 | **`Gyro X / Y / Z`** (`deg/s`) & **`Acc X / Y / Z`** (`g`) | Mesures inertielles synchronisées sur horloge réseau partagée |
 | **`Sync Edge`** (`0 / 1`) | Fronts TTL/BNC issus du *Serial Accessory* (`serial_mode = 4` / Sync, firmware `v2.6.0+`) |
 | **`Sync Only`** *(par IMU)* | Case à cocher pour n'enregistrer que `Sync Edge` sur l'IMU Base |
-| **`Include Magnetometer`** / **`Include Diagnostics`** | Canaux optionnels `Mag X/Y/Z` (`uT`), `Battery Pct` et `Rssi Pct` |
+| **`Require BNC Hardware Sync`** | Décochée par défaut (synchro Wi-Fi) ; si cochée, exige `serial_mode = 4` et un signal BNC actif (< 2,5 s) |
+| **`Include Diagnostics`** *(activé par défaut)* | Ajoute `Battery Pct` (`%`) et `Rssi Pct` (`%`) sur chaque IMU |
+| **`Include Magnetometer`** *(optionnel)* | Ajoute `Mag X / Y / Z` (`uT`) sur chaque IMU |
 | **`src/ImuDeviceManager.cpp`** | Découverte Wi-Fi UDP / USB et rééchantillonnage multi-IMU synchronisé |
 | **`src/QDevicePlugin.cpp`** | Point d'entrée QDevice API `0.10.6` (`qd_device_category_imu`) |
